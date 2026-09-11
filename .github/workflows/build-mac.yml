@@ -1,0 +1,107 @@
+name: Build TabTin macOS
+
+# TabTin Community 自托管版 macOS 打包（只出 arm64）
+# 地址是**编译期**注入的，来自仓库变量 TABTIN_SERVER（默认 47.110.89.224）；
+# 换服务器只改变量、不改代码。UPDATE_FEED_URL 必须留空（该字段强制 HTTPS）。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'target arch'
+        type: choice
+        options: [arm64, x64]
+        default: arm64
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    name: mac-${{ github.event.inputs.arch || 'arm64' }}
+    # macos-14 = Apple Silicon(arm64)；x64 需显式派发
+    runs-on: ${{ (github.event.inputs.arch || 'arm64') == 'x64' && 'macos-15-intel' || 'macos-14' }}
+    timeout-minutes: 300
+    env:
+      TABTIN_SERVER: ${{ vars.TABTIN_SERVER || '47.110.89.224' }}
+      TABTIN_COMMUNITY_API_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060/api
+      TABTIN_COMMUNITY_CENTRIFUGO_WS_URL: ws://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:8100/connection/websocket
+      TABTIN_COMMUNITY_PUBLIC_WEB_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060
+      TABTIN_COMMUNITY_WEBSITE_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          sw_vers; uname -m; df -h /
+          echo "目标服务器: $TABTIN_SERVER"
+          echo "API: $TABTIN_COMMUNITY_API_BASE_URL"
+          echo "WS : $TABTIN_COMMUNITY_CENTRIFUGO_WS_URL"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm (corepack)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+          node -v; pnpm -v
+
+      - name: Setup Go (打包内置 Go CLI 必需)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/tabtin-cli-go/go.mod
+          cache-dependency-path: packages/tabtin-cli-go/go.sum
+
+      - name: Install dependencies
+        timeout-minutes: 60
+        run: |
+          pnpm install --frozen-lockfile || pnpm install
+
+      - name: 预检构建变量（零成本，先拦地址问题）
+        run: |
+          cd apps/tabtin-electron
+          TABTIN_COMMUNITY_PROFILE_VALIDATE_ONLY=1 bash scripts/build-packaged-app.sh mac community
+
+      - name: Build dmg (community)
+        timeout-minutes: 150
+        run: |
+          cd apps/tabtin-electron
+          pnpm build:mac:community
+
+      - name: 出厂验收（地址烙入 / 无回环残留 / 架构）
+        continue-on-error: true
+        run: |
+          set +e
+          RUN_DIR=$(ls -td apps/tabtin-electron/dist-app-runs/*/ 2>/dev/null | head -1)
+          echo "产物目录: $RUN_DIR"
+          ls -la "$RUN_DIR" 2>/dev/null
+          APP=$(find "$RUN_DIR" -maxdepth 3 -name "*.app" -type d 2>/dev/null | head -1)
+          echo "APP=$APP"
+          if [ -n "$APP" ]; then
+            ASAR="$APP/Contents/Resources/app.asar"
+            echo -n "asar 内 ${TABTIN_SERVER} 出现次数(期望>0): "; grep -a -c "$TABTIN_SERVER" "$ASAR" 2>/dev/null
+            echo -n "asar 内 127.0.0.1:6060 残留(期望0):        "; grep -a -c "127.0.0.1:6060" "$ASAR" 2>/dev/null
+            BIN=$(ls "$APP/Contents/MacOS/" 2>/dev/null | head -1)
+            echo "BIN=$BIN"; lipo -archs "$APP/Contents/MacOS/$BIN" 2>/dev/null
+          fi
+          find "$RUN_DIR" -name "*.dmg" -exec ls -lh {} \; 2>/dev/null
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_DIR=$(ls -td apps/tabtin-electron/dist-app-runs/*/ 2>/dev/null | head -1)
+          DMG=$(find "$RUN_DIR" -name "*.dmg" | head -1)
+          if [ -z "$DMG" ]; then echo "!! 没找到 dmg，跳过发布"; ls -laR "$RUN_DIR" | head -50; exit 1; fi
+          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
+          TAG="mac-${ARCH}-run${{ github.run_number }}"
+          gh release create "$TAG" "$DMG" \
+            --title "TabTin macOS ${ARCH} (run ${{ github.run_number }})" \
+            --notes "自托管社区版 · 服务器 http://${TABTIN_SERVER}:6060 · 未签名（首次打开需右键“打开”或 xattr -d com.apple.quarantine）· $(uname -m)"

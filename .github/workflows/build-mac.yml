@@ -1,8 +1,10 @@
 name: Build TabTin macOS
 
-# TabTin Community 自托管版 macOS 打包（只出 arm64）
-# 地址是**编译期**注入的，来自仓库变量 TABTIN_SERVER（默认 47.110.89.224）；
-# 换服务器只改变量、不改代码。UPDATE_FEED_URL 必须留空（该字段强制 HTTPS）。
+# TabTin Community 自托管版 macOS 打包。
+# 服务器地址来自 **Secret** `TABTIN_SERVER`（公开仓库下 vars 对所有人可见，故用 secret）。
+# 地址是编译期注入的，换服务器只改 secret、不改代码。
+# 注意：地址最终会被编译进 app.asar，任何拿到安装包的人都能看出 IP —— secret 只防"仓库/日志泄露"。
+# 因此本 workflow **不发布公开 Release**，只上传 artifact（保留 1 天，取走后即删）。
 
 on:
   push:
@@ -10,37 +12,42 @@ on:
   workflow_dispatch:
     inputs:
       arch:
-        description: 'target arch'
+        description: 'target arch (x64 = 4核/14G；arm64 = 3核/7G)'
         type: choice
-        options: [arm64, x64]
-        default: arm64
+        options: [x64, arm64]
+        default: x64
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   mac:
-    name: mac-${{ github.event.inputs.arch || 'arm64' }}
-    # macos-14 = Apple Silicon(arm64)；x64 需显式派发
-    runs-on: ${{ (github.event.inputs.arch || 'arm64') == 'x64' && 'macos-15-intel' || 'macos-14' }}
+    name: mac-${{ github.event.inputs.arch || 'x64' }}
+    runs-on: ${{ (github.event.inputs.arch || 'x64') == 'arm64' && 'macos-14' || 'macos-15-intel' }}
     timeout-minutes: 300
     env:
-      TABTIN_SERVER: ${{ vars.TABTIN_SERVER || '47.110.89.224' }}
-      TABTIN_COMMUNITY_API_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060/api
-      TABTIN_COMMUNITY_CENTRIFUGO_WS_URL: ws://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:8100/connection/websocket
-      TABTIN_COMMUNITY_PUBLIC_WEB_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060
-      TABTIN_COMMUNITY_WEBSITE_BASE_URL: http://${{ vars.TABTIN_SERVER || '47.110.89.224' }}:6060
+      TABTIN_SERVER: ${{ secrets.TABTIN_SERVER }}
+      TABTIN_COMMUNITY_API_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060/api
+      TABTIN_COMMUNITY_CENTRIFUGO_WS_URL: ws://${{ secrets.TABTIN_SERVER }}:8100/connection/websocket
+      TABTIN_COMMUNITY_PUBLIC_WEB_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060
+      TABTIN_COMMUNITY_WEBSITE_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
+      - name: 校验服务器地址已注入
+        run: |
+          if [ -z "${TABTIN_SERVER:-}" ]; then
+            echo "::error::secret TABTIN_SERVER 未设置（fork 发起的 PR 拿不到 secret，属预期）"
+            exit 1
+          fi
+          echo "目标服务器已注入（值不打印）"
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Runner info
         run: |
-          sw_vers; uname -m; df -h /
-          echo "目标服务器: $TABTIN_SERVER"
-          echo "API: $TABTIN_COMMUNITY_API_BASE_URL"
-          echo "WS : $TABTIN_COMMUNITY_CENTRIFUGO_WS_URL"
+          sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize; df -h /
+          echo "API host 已注入: $(echo "$TABTIN_COMMUNITY_API_BASE_URL" | sed -E 's#//[^/]+#//<hidden>#')"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -59,10 +66,20 @@ jobs:
           go-version-file: packages/tabtin-cli-go/go.mod
           cache-dependency-path: packages/tabtin-cli-go/go.sum
 
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
       - name: Install dependencies
         timeout-minutes: 60
-        run: |
-          pnpm install --frozen-lockfile || pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: 预检构建变量（零成本，先拦地址问题）
         run: |
@@ -70,7 +87,7 @@ jobs:
           TABTIN_COMMUNITY_PROFILE_VALIDATE_ONLY=1 bash scripts/build-packaged-app.sh mac community
 
       - name: Build dmg (community)
-        timeout-minutes: 150
+        timeout-minutes: 180
         run: |
           cd apps/tabtin-electron
           pnpm build:mac:community
@@ -86,22 +103,24 @@ jobs:
           echo "APP=$APP"
           if [ -n "$APP" ]; then
             ASAR="$APP/Contents/Resources/app.asar"
-            echo -n "asar 内 ${TABTIN_SERVER} 出现次数(期望>0): "; grep -a -c "$TABTIN_SERVER" "$ASAR" 2>/dev/null
-            echo -n "asar 内 127.0.0.1:6060 残留(期望0):        "; grep -a -c "127.0.0.1:6060" "$ASAR" 2>/dev/null
+            echo -n "asar 内目标 IP 出现次数(期望>0): "; grep -a -c "$TABTIN_SERVER" "$ASAR" 2>/dev/null
+            echo -n "asar 内 127.0.0.1:6060 残留(期望0):  "; grep -a -c "127.0.0.1:6060" "$ASAR" 2>/dev/null
             BIN=$(ls "$APP/Contents/MacOS/" 2>/dev/null | head -1)
             echo "BIN=$BIN"; lipo -archs "$APP/Contents/MacOS/$BIN" 2>/dev/null
+            echo "--- 内嵌关键资源 ---"
+            for f in Resources/tabtin-cli-go/dist/tabtin Resources/tabtin-filegen-python-dist-src/tabtin-filegen; do
+              [ -e "$APP/Contents/$f" ] && echo "  OK   $f" || echo "  MISS $f"
+            done
           fi
           find "$RUN_DIR" -name "*.dmg" -exec ls -lh {} \; 2>/dev/null
+          echo "SERVER_HASH=$(printf '%s' "$TABTIN_SERVER" | shasum -a 256 | cut -c1-12)" >> $GITHUB_ENV
 
-      - name: Publish release asset
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RUN_DIR=$(ls -td apps/tabtin-electron/dist-app-runs/*/ 2>/dev/null | head -1)
-          DMG=$(find "$RUN_DIR" -name "*.dmg" | head -1)
-          if [ -z "$DMG" ]; then echo "!! 没找到 dmg，跳过发布"; ls -laR "$RUN_DIR" | head -50; exit 1; fi
-          ARCH="${{ github.event.inputs.arch || 'arm64' }}"
-          TAG="mac-${ARCH}-run${{ github.run_number }}"
-          gh release create "$TAG" "$DMG" \
-            --title "TabTin macOS ${ARCH} (run ${{ github.run_number }})" \
-            --notes "自托管社区版 · 服务器 http://${TABTIN_SERVER}:6060 · 未签名（首次打开需右键“打开”或 xattr -d com.apple.quarantine）· $(uname -m)"
+      - name: 上传产物（保留 1 天，取走后删除）
+        uses: actions/upload-artifact@v4
+        with:
+          name: tabtin-mac-${{ github.event.inputs.arch || 'x64' }}-run${{ github.run_number }}
+          path: |
+            apps/tabtin-electron/dist-app-runs/*/**/*.dmg
+            apps/tabtin-electron/dist-app-runs/*/**/*.zip
+          if-no-files-found: error
+          retention-days: 1

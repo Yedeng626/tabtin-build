@@ -100,9 +100,11 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          RUN_DIR=$(ls -td apps/tabtin-electron/dist-app-runs/*/ 2>/dev/null | head -1)
+          # 产物落在 apps/tabtin-electron/dist-app（不是 dist-app-runs/*——那是旧假设，曾导致
+          # 本步静默空跑 + 上传步骤 No files were found 而整体判失败）。
+          RUN_DIR=apps/tabtin-electron/dist-app
           echo "产物目录: $RUN_DIR"
-          ls -la "$RUN_DIR" 2>/dev/null
+          ls -la "$RUN_DIR"
           APP=$(find "$RUN_DIR" -maxdepth 3 -name "*.app" -type d 2>/dev/null | head -1)
           echo "APP=$APP"
           if [ -n "$APP" ]; then
@@ -116,15 +118,16 @@ jobs:
               [ -e "$APP/Contents/$f" ] && echo "  OK   $f" || echo "  MISS $f"
             done
           fi
-          find "$RUN_DIR" -name "*.dmg" -exec ls -lh {} \; 2>/dev/null
+          echo "--- 待上传产物（重签后重建的那个 DMG 才是最终包）---"
+          ls -lh "$RUN_DIR"/tabtin-community-*.dmg 2>/dev/null
+          shasum -a 256 "$RUN_DIR"/tabtin-community-*.dmg 2>/dev/null
           echo "SERVER_HASH=$(printf '%s' "$TABTIN_SERVER" | shasum -a 256 | cut -c1-12)" >> $GITHUB_ENV
 
       - name: 上传产物（保留 1 天，取走后删除）
         uses: actions/upload-artifact@v4
         with:
           name: tabtin-mac-${{ github.event.inputs.arch || 'x64' }}-run${{ github.run_number }}
-          path: |
-            apps/tabtin-electron/dist-app-runs/*/**/*.dmg
-            apps/tabtin-electron/dist-app-runs/*/**/*.zip
+          # 只发重签后重建的最终 DMG：<app>-<version>-<arch>.dmg（electron-builder 原始 DMG 在重签前产出，不发）
+          path: apps/tabtin-electron/dist-app/tabtin-community-*.dmg
           if-no-files-found: error
           retention-days: 1

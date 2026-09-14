@@ -114,9 +114,8 @@ jobs:
             BIN=$(ls "$APP/Contents/MacOS/" 2>/dev/null | head -1)
             echo "BIN=$BIN"; lipo -archs "$APP/Contents/MacOS/$BIN" 2>/dev/null
             echo "--- 内嵌关键资源 ---"
-            for f in Resources/tabtin-cli-go/dist/tabtin Resources/tabtin-filegen-python-dist-src/tabtin-filegen; do
-              [ -e "$APP/Contents/$f" ] && echo "  OK   $f" || echo "  MISS $f"
-            done
+            echo "  go CLI: $(find "$APP/Contents/Resources" -path '*tabtin-cli-go/dist/tabtin' | head -1 || echo MISS)"
+            echo "  filegen: $(find "$APP/Contents/Resources" -name 'tabtin-filegen' -maxdepth 3 2>/dev/null | head -1 || echo MISS)"
           fi
           echo "--- 待上传产物（重签后重建的那个 DMG 才是最终包）---"
           ls -lh "$RUN_DIR"/tabtin-community-*.dmg 2>/dev/null

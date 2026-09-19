@@ -1,0 +1,135 @@
+name: Build TabTin macOS
+
+# TabTin Community 自托管版 macOS 打包。
+# 服务器地址来自 **Secret** `TABTIN_SERVER`（公开仓库下 vars 对所有人可见，故用 secret）。
+# 地址是编译期注入的，换服务器只改 secret、不改代码。
+# 注意：地址最终会被编译进 app.asar，任何拿到安装包的人都能看出 IP —— secret 只防"仓库/日志泄露"。
+# 因此本 workflow **不发布公开 Release**，只上传 artifact（保留 1 天，取走后即删）。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'target arch (x64 = 4核/14G；arm64 = 3核/7G)'
+        type: choice
+        options: [x64, arm64]
+        default: x64
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    name: mac-${{ github.event.inputs.arch || 'x64' }}
+    runs-on: ${{ (github.event.inputs.arch || 'x64') == 'arm64' && 'macos-14' || 'macos-15-intel' }}
+    timeout-minutes: 300
+    env:
+      TABTIN_SERVER: ${{ secrets.TABTIN_SERVER }}
+      # 打包脚本里的 `pnpm run typecheck`(tsc --noEmit) 会 OOM：Node 默认堆约 2GB，
+      # 首次跑实测在 80s 处 "Ineffective mark-compacts near heap limit" 后 abort(134)。
+      # x64 runner(macos-15-intel, 14G) 给 8G 堆；arm64(macos-14, 7G) 给 4.5G。
+      NODE_OPTIONS: --max-old-space-size=${{ (github.event.inputs.arch || 'x64') == 'arm64' && '4608' || '8192' }}
+      TABTIN_COMMUNITY_API_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060/api
+      TABTIN_COMMUNITY_CENTRIFUGO_WS_URL: ws://${{ secrets.TABTIN_SERVER }}:8100/connection/websocket
+      TABTIN_COMMUNITY_PUBLIC_WEB_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060
+      TABTIN_COMMUNITY_WEBSITE_BASE_URL: http://${{ secrets.TABTIN_SERVER }}:6060
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: 校验服务器地址已注入
+        run: |
+          if [ -z "${TABTIN_SERVER:-}" ]; then
+            echo "::error::secret TABTIN_SERVER 未设置（fork 发起的 PR 拿不到 secret，属预期）"
+            exit 1
+          fi
+          echo "目标服务器已注入（值不打印）"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize; df -h /
+          echo "API host 已注入: $(echo "$TABTIN_COMMUNITY_API_BASE_URL" | sed -E 's#//[^/]+#//<hidden>#')"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm (corepack)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+          node -v; pnpm -v
+
+      - name: Setup Go (打包内置 Go CLI 必需)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: packages/tabtin-cli-go/go.mod
+          cache-dependency-path: packages/tabtin-cli-go/go.sum
+
+      - name: Resolve pnpm store path
+        id: pnpm-store
+        run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install dependencies
+        timeout-minutes: 60
+        run: pnpm install --frozen-lockfile
+
+      - name: 预检构建变量（零成本，先拦地址问题）
+        run: |
+          cd apps/tabtin-electron
+          TABTIN_COMMUNITY_PROFILE_VALIDATE_ONLY=1 bash scripts/build-packaged-app.sh mac community
+
+      - name: Build dmg (community)
+        timeout-minutes: 180
+        run: |
+          cd apps/tabtin-electron
+          pnpm build:mac:community
+
+      - name: 出厂验收（地址烙入 / 无回环残留 / 架构）
+        continue-on-error: true
+        run: |
+          set +e
+          # 产物落在 apps/tabtin-electron/dist-app（不是 dist-app-runs/*——那是旧假设，曾导致
+          # 本步静默空跑 + 上传步骤 No files were found 而整体判失败）。
+          RUN_DIR=apps/tabtin-electron/dist-app
+          echo "产物目录: $RUN_DIR"
+          ls -la "$RUN_DIR"
+          APP=$(find "$RUN_DIR" -maxdepth 3 -name "*.app" -type d 2>/dev/null | head -1)
+          echo "APP=$APP"
+          if [ -n "$APP" ]; then
+            ASAR="$APP/Contents/Resources/app.asar"
+            echo -n "asar 内目标 IP 出现次数(期望>0): "; grep -a -c "$TABTIN_SERVER" "$ASAR" 2>/dev/null
+            echo -n "asar 内 127.0.0.1:6060 残留(期望0):  "; grep -a -c "127.0.0.1:6060" "$ASAR" 2>/dev/null
+            BIN=$(ls "$APP/Contents/MacOS/" 2>/dev/null | head -1)
+            echo "BIN=$BIN"; lipo -archs "$APP/Contents/MacOS/$BIN" 2>/dev/null
+            echo "--- 内嵌关键资源 ---"
+            echo "  go CLI: $(find "$APP/Contents/Resources" -path '*tabtin-cli-go/dist/tabtin' | head -1 || echo MISS)"
+            echo "  filegen: $(find "$APP/Contents/Resources" -name 'tabtin-filegen' -maxdepth 3 2>/dev/null | head -1 || echo MISS)"
+          fi
+          echo "--- 待上传产物（重签后重建的那个 DMG 才是最终包）---"
+          # 改名后最终 DMG 是 <executable>-<version>-<arch>.dmg（community = qizhikitty-*）；
+          # electron-builder 原始 DMG（无 -arch 后缀）在重签前产出，不在此列。
+          ls -lh "$RUN_DIR"/*.dmg 2>/dev/null
+          shasum -a 256 "$RUN_DIR"/*.dmg 2>/dev/null
+          echo "SERVER_HASH=$(printf '%s' "$TABTIN_SERVER" | shasum -a 256 | cut -c1-12)" >> $GITHUB_ENV
+
+      - name: 上传产物（保留 1 天，取走后删除）
+        uses: actions/upload-artifact@v4
+        with:
+          name: tabtin-mac-${{ github.event.inputs.arch || 'x64' }}-run${{ github.run_number }}
+          # 只发重签后重建的最终 DMG：<executable>-<version>-<arch>.dmg（community 改名后是 qizhikitty-<ver>-<arch>.dmg）；
+          # electron-builder 原始 DMG 在重签前产出，不发。用 -<arch> 后缀把两类区分开。
+          path: apps/tabtin-electron/dist-app/*-${{ github.event.inputs.arch || 'x64' }}.dmg
+          if-no-files-found: error
+          retention-days: 1
